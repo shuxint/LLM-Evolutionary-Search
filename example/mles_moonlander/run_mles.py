@@ -10,7 +10,7 @@ from llm4ad.method.mles import MLESProfiler
 
 def main():
     llm = HttpsApi(host='api.bltcy.ai',  # your host endpoint, e.g., api.openai.com/v1/completions, api.deepseek.com
-                   key='sk-GhnvOwHkmjIjfxgiU9765BfcssvBUvfW2UNT6WMhlYFqYhwX',  # your key, e.g., sk-abcdefghijklmn
+                   key='sk-qMAtcWpKnF64zZxWqyLcqXRQYEtwnyiriaB0nR5GBldQ7S0A',  # your key, e.g., sk-abcdefghijklmn
                    model='gpt-4o-mini',  # your llm, e.g., gpt-3.5-turbo, deepseek-chat
                    timeout=120)
     log_dir = f'logs/MLES'  # Use run_id to avoid overwriting logs
@@ -44,15 +44,16 @@ def main():
     seedpath = r'pop_init.json'
 
     method = MLES(llm=llm,
-                  profiler=MLESProfiler(log_dir=log_dir, log_style='complex'),
+                  profiler=MLESProfiler(log_dir=log_dir, log_style='complex', run_mode=run_mode,
+                                               using_algo_designed_path=using_algo_designed_path),
                   evaluation=task,
-                  max_sample_nums=50,
+                  max_sample_nums=100,
                   max_generations=None,
-                  pop_size=8,
-                  num_samplers=1,
-                  num_evaluators=1,
+                  pop_size=16,
+                  num_samplers=8,
+                  num_evaluators=8,
                   debug_mode=False,
-                  operators=('e1', 'e2', 'm1', 'm2_M'),  # ('e1', 'e2', 'm1_M', 'm2_M')
+                  operators=('e1', 'e2', 'm1_M', 'm2_M'),  # ('e1', 'e2', 'm1_M', 'm2_M')
                   seed_path=seedpath
                   )
 
