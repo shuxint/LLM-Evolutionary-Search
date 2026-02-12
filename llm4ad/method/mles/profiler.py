@@ -28,7 +28,7 @@ class MLESProfiler(ProfilerBase):
                  create_random_path=True,
                  run_mode='Training',
                  **kwargs):
-        """EoH Profiler
+        """MLES Profiler
         Args:
             log_dir            : the directory of current run
             evaluation_name    : the name of the evaluation instance (the name of the problem to be solved).

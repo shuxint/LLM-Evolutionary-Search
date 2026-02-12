@@ -72,10 +72,12 @@ class MLES:
             initial_sample_nums_max     : maximum samples restriction during initialization.
             **kwargs                    : some args pass to 'llm4ad.base.SecureEvaluator'. Such as 'fork_proc'.
         """
+        # Core components for evaluation and task context
         self.evaluation_object = evaluation
         self._template_program_str = evaluation.template_program
         self._task_description_str = evaluation.task_description
 
+        # Evolution constraints and parameters
         self.seed_path = seed_path
         self._max_generations = max_generations
         self._max_sample_nums = max_sample_nums
@@ -83,9 +85,10 @@ class MLES:
         self._selection_num = selection_num
         self.operators = operators
 
-        self.check_before_running() # check whether satisfy the operator
+        # Validate operator requirements (e.g., text descriptions for specific operators)
+        self.check_before_running()
 
-        # samplers and evaluators
+        # Concurrency and runtime settings
         self._num_samplers = num_samplers
         self._num_evaluators = num_evaluators
         self._resume_mode = resume_mode
@@ -99,22 +102,20 @@ class MLES:
         self._function_to_evolve_name: str = self._function_to_evolve.name
         self._template_program: Program = TextFunctionProgramConverter.text_to_program(self._template_program_str)
 
-        # population, sampler, and evaluator
+        # Initialize core modules: Population storage, LLM sampler, and Secure evaluator
         self._population = Population(pop_size=self._pop_size)
         self._sampler = MLESSampler(llm, self._template_program_str)
         self._evaluator = SecureEvaluator(evaluation, debug_mode=debug_mode, **kwargs)
         self._profiler = profiler
 
-        # statistics
+        # Internal counters
         self._tot_sample_nums = 0
-
-        # reset _initial_sample_nums_max
         self._initial_sample_nums_max = max(
             self._initial_sample_nums_max,
             2 * self._pop_size
         )
 
-        # multi-thread executor for evaluation
+        # Setup parallel executor for performance evaluation
         assert multi_thread_or_process_eval in ['thread', 'process']
         if multi_thread_or_process_eval == 'thread':
             self._evaluation_executor = concurrent.futures.ThreadPoolExecutor(
@@ -125,12 +126,12 @@ class MLES:
                 max_workers=num_evaluators
             )
 
-        # pass parameters to profiler
+        # Log initial parameters
         if profiler is not None:
-            self._profiler.record_parameters(llm, evaluation, self)  # ZL: necessary
+            self._profiler.record_parameters(llm, evaluation, self)
 
     def check_before_running(self):
-        # 检查是否有 non_image_representation_explanation 属性
+        """Verify that the evaluation object provides required text descriptions for specific operators."""
         if 'm1_text' in self.operators:
             if hasattr(self.evaluation_object, 'non_image_representation_explanation'):
                 self._information_discription = self.evaluation_object.non_image_representation_explanation
@@ -139,8 +140,8 @@ class MLES:
                     "When 'text' is in operators, non image information description of this task cannot be empty")
 
     def init_from_local_algo_base(self):
+        """Bootstrap the population using pre-existing algorithms from a local JSON seed file."""
         if os.path.exists(self.seed_path):
-            # 打开并读取JSON文件
             with open(self.seed_path, 'r', encoding='utf-8') as file:
                 seeds = json.load(file)
         else:
@@ -150,19 +151,21 @@ class MLES:
 
         operator = 'load'
         for seed_individual in seeds:
+            # Parse function code and reconstruct the program structure
             seed_str = seed_individual['function']
             seed_algorithm = seed_individual['algorithm']
             program = TextFunctionProgramConverter.function_to_program(seed_str, self._template_program)
             program_str = str(program)
             func = TextFunctionProgramConverter.text_to_function(program_str)
 
+            # Evaluate the seed program and record performance
             score_images_dict, eval_time = self._evaluation_executor.submit(
                 self._evaluator.evaluate_program_record_time,
                 program
             ).result()
 
+            # Metadata assignment and population registration
             if score_images_dict is not None:
-                # register to profiler
                 func.score = score_images_dict['score']
                 func.image64 = score_images_dict['image']
                 func.observation = score_images_dict['observation']
@@ -183,29 +186,31 @@ class MLES:
                     self._profiler.register_population(self._population)
 
     def _sample_evaluate_register(self, prompt, image_prompt=None, messages=None, operator_name="", parent_number=None):
-        """Perform following steps:
-        1. Sample an algorithm using the given prompt.
-        2. Evaluate it by submitting to the process/thread pool, and get the results.
-        3. Add the function to the population and register it to the profiler.
+        """
+        Execute the full evolutionary cycle for a single candidate:
+        1. Sample: Query LLM for new algorithm design and code.
+        2. Evaluate: Run the code in a secure parallel executor.
+        3. Register: Store the individual in the population and log results.
         """
         sample_start = time.time()
         thought, func, response = self._sampler.get_thought_and_function(prompt, image_prompt, messages)
         sample_time = time.time() - sample_start
+
         if thought is None or func is None:
             return
-        # convert to Program instance
+
         program = TextFunctionProgramConverter.function_to_program(func, self._template_program)
         if program is None:
             return
-        # evaluate
-        # score_images_dict
+
+        # Synchronously wait for parallel evaluation result
         score_images_dict, eval_time = self._evaluation_executor.submit(
             self._evaluator.evaluate_program_record_time,
             program
         ).result()
 
+        # Update function object with evaluation feedback and lineage
         if score_images_dict is not None:
-            # register to profiler
             func.score = score_images_dict['score']
             func.image64 = score_images_dict['image']
             func.observation = score_images_dict['observation']
@@ -223,6 +228,7 @@ class MLES:
         # register to the population
         self._population.register_function(func)
 
+        # register to the log
         if self._profiler is not None:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, MLESProfiler):
@@ -230,6 +236,7 @@ class MLES:
             self._tot_sample_nums += 1
 
     def _continue_loop(self) -> bool:
+        """Check if termination conditions (max generations or max samples) have been met."""
         if self._max_generations is None and self._max_sample_nums is None:
             return True
         elif self._max_generations is not None and self._max_sample_nums is None:
@@ -241,15 +248,18 @@ class MLES:
                     and self._tot_sample_nums < self._max_sample_nums)
 
     def _iteratively_use_mles_operator(self, tid=0):
-        # 使用 itertools.cycle 使 operators 循环
+        """
+        Main evolutionary loop: iteratively applies search operators to the population.
+        Supports multi-threaded sampling by offsetting the operator cycle based on thread ID.
+        """
+        # Cycle through available operators to ensure diverse search start for each thread
         operator_cycle = itertools.cycle(self.operators)
         for _ in range(tid):
-            # 获取当前循环的 operator
             _ = next(operator_cycle)
 
         while self._continue_loop():
             try:
-                # 获取当前循环的 operator
+                # get current operator
                 operator = next(operator_cycle)
 
                 if operator == 'e1_advanced':
@@ -382,7 +392,7 @@ class MLES:
                     if not self._continue_loop():
                         break
 
-                # TODO：测试这个算子
+                # no figure itself
                 elif operator == 'm1_only_imagedescribtion':
                     indivs = self._population.selection()
                     indiv = indivs[0]
@@ -437,8 +447,9 @@ class MLES:
                     if not self._continue_loop():
                         break
 
+                # --- ABLATION OPERATORS (nothought) ---
+                # Variants that without the "thought" of the algorithm during the algorithm generation.
                 elif operator == 'e1_nothought':
-                    # get a new func using e1
                     indivs = self._population.selection(number=self._selection_num)
                     parents_pop_register_number = [ind.pop_register_number for ind in indivs]
                     prompt = MLESPrompt.get_prompt_e1_nothought(self._task_description_str, indivs,
@@ -450,7 +461,6 @@ class MLES:
                     if not self._continue_loop():
                         break
 
-                # get a new func using e2
                 elif operator == 'e2_nothought':
                     indivs = self._population.selection(number=self._selection_num)
                     parents_pop_register_number = [ind.pop_register_number for ind in indivs]
@@ -507,16 +517,22 @@ class MLES:
             pass
 
     def _iteratively_init_population(self, tid=0):
-        """Let a thread repeat {sample -> evaluate -> register to population}
-        to initialize a population.
+        """
+        Populate the initial generation by repeatedly sampling from the LLM.
+        This loop continues until the population reaches the required size or
+        the maximum initialization sample limit is exceeded.
         """
         while self._population.generation == 0:
             try:
-                # get a new func using i1
+                # Generate a 'zero-shot' initialization prompt for the task
                 prompt = MLESPrompt.get_prompt_i1(self._task_description_str, self._function_to_evolve)
                 if self._debug_mode:
                     print('Init Prompt: ', prompt)
+
+                # Sample, evaluate, and add to population if valid
                 self._sample_evaluate_register(prompt, operator_name="Initialization")
+
+                # Safety break to prevent infinite loops if the LLM fails to generate valid code
                 if self._tot_sample_nums > self._initial_sample_nums_max:
                     print(f'Warning: Initialization not accomplished in {self._initial_sample_nums_max} samples !!!')
                     break
@@ -527,8 +543,9 @@ class MLES:
                 continue
 
     def _multi_threaded_sampling(self, fn: callable, *args, **kwargs):
-        """Execute `fn` using multithreading.
-        In EoH, `fn` can be `self._iteratively_init_population` or `self._iteratively_use_eoh_operator`.
+        """
+        Execute sampling functions (initialization or evolution) in parallel.
+        Uses standard threading to handle multiple concurrent LLM requests.
         """
         # threads for sampling
         sampler_threads = [
@@ -541,89 +558,96 @@ class MLES:
             t.join()
 
     def run(self):
+        """
+        Entry point for the MLES search process:
+        1. Initialize: Load from local seeds and/or perform LLM-based cold start.
+        2. Evolve: Run the iterative mutation/crossover pipeline until termination.
+        3. Finalize: Shut down profilers and save final results.
+        """
         if not self._resume_mode:
+            # Phase 1: Population Initialization
             print("🌱 Initializing population from database...")
             self.init_from_local_algo_base()
-            # do initialization
+
             print("🌱 Initializing population by LLM...")
             self._multi_threaded_sampling(self._iteratively_init_population)
-            # terminate searching if
+
+            # Validation: Ensure we have enough individuals to perform evolutionary operators
             if len(self._population) < self._selection_num:
                 print(
                     f'The search is terminated since EoH unable to obtain {self._selection_num} feasible algorithms during initialization. '
                     f'Please increase the `initial_sample_nums_max` argument (currently {self._initial_sample_nums_max}). '
                     f'Please also check your evaluation implementation and LLM implementation.')
                 return
+
+        # Phase 2: Evolutionary Search Loop
         print("🧬 Starting evolutionary training pipeline...")
-        # evolutionary search
         self._multi_threaded_sampling(self._iteratively_use_mles_operator)
-        # finish
+
+        # Phase 3: Cleanup and Reporting
         if self._profiler is not None:
             self._profiler.finish()
 
-    # 修改函数签名，增加 top_k 参数 (默认为 None，表示全部运行)
     def using_flow(self, worst_case_percent=10, top_k=None):
+        """
+        Executes the 'Using Mode' pipeline:
+        1. Loads the latest evolved population from local storage.
+        2. Filters the top-K performing algorithms if specified.
+        3. Evaluates all selected algorithms on a set of new test instances.
+        4. Identifies the best-performing algorithm for each specific instance.
+        5. Computes overall statistics and worst-case performance metrics.
+        """
         print(f"🔍 Loading model from {self._profiler._log_dir}...")
         designed_results_path = os.path.join(self._profiler._log_dir, 'population')
 
-        # 1. Define the pattern to match 'pop_X.json' and capture 'X'
+        # --- STEP 1: Locate the latest population file (e.g., pop_10.json) ---
         pattern = re.compile(r'^pop_(\d+)\.json$')
-
         max_x = -1
         latest_file = None
 
-        # 2. Check if the directory exists
         if not os.path.isdir(designed_results_path):
             print(f"Error: Directory not found: {designed_results_path}")
-            return  # Or raise an Exception
+            return
 
-        # 3. Iterate over files in the directory
+        # Iterate over files in the directory
         for filename in os.listdir(designed_results_path):
             match = pattern.match(filename)
 
-            # 4. If the filename matches
+            # If the filename matches
             if match:
                 # Extract the number (group 1) and convert to int
                 current_x = int(match.group(1))
 
-                # 5. Check if it's the largest number found so far
+                # Check if it's the largest number found so far
                 if current_x > max_x:
                     max_x = current_x
                     latest_file = filename
 
-        # 6. Check if any matching file was found
+        # Check if any matching file was found
         if latest_file is None:
             print(f"Error: No 'pop_x.json' files found in {designed_results_path}")
             return  # Or raise an Exception
 
-        # 7. Construct the full path to the correct file
+        # Construct the full path to the correct file
         full_path_to_file = os.path.join(designed_results_path, latest_file)
         print(f"Found latest file: {full_path_to_file}")
-
-        # --- End of file finding logic ---
 
         with open(full_path_to_file, 'r') as f:
             trained_data = json.load(f)
 
-        # ===================================================================
-        # [新增逻辑] Top-K 筛选
-        # ===================================================================
+        # --- STEP 2: Top-K Filtering ---
+        # Reduce the search space by only testing the highest-scoring algorithms from training.
         if top_k is not None and isinstance(top_k, int) and top_k > 0:
             print(f"✂️  Filtering Population: Selecting top {top_k} algorithms...")
             original_size = len(trained_data)
 
-            # 假设 json 中的每个 item 都有 'fitness' 字段。
-            # 如果是最大化问题 (score越高越好)，使用 reverse=True。
-            # 这里使用了 get('fitness', -inf) 防止字段缺失报错。
             try:
+                # Sort algorithms by training score in descending order
                 trained_data.sort(key=lambda x: x.get('score', float('-inf')), reverse=True)
-
-                # 截取前 k 个
                 trained_data = trained_data[:top_k]
                 print(f"   -> Reduced population from {original_size} to {len(trained_data)}.")
             except Exception as e:
                 print(f"   -> ⚠️ Warning: Could not sort by 'score'. Using original order. Error: {e}")
-        # ===================================================================
 
         using_time_start = time.time()
         print("💪 [Brute Force Mode] Evaluating selected algorithms on each instance...")
@@ -635,7 +659,8 @@ class MLES:
         final_results = {}
         all_scores = []
 
-        # --- b. 遍历每个实例，并用所有算法进行测试 ---
+        # --- STEP 3: Brute Force Evaluation ---
+        # Iterate through each test instance and test every algorithm in the filtered pool.
         for instance_id in ins_to_be_solve_id_set:
             print(f"\n[Brute Force] Solving new instance: {instance_id}")
             best_algo_for_instance = None
@@ -643,9 +668,9 @@ class MLES:
             best_perf_for_instance = None
 
             for i, algo_json in enumerate(trained_data):
-                # 显示进度
                 print(f"  -> Testing algorithm {i + 1}/{len(trained_data)}...", end='\r')
                 try:
+                    # Parse algorithm code and execute secure evaluation
                     program = TextFunctionProgramConverter.function_to_program(algo_json['function'],
                                                                                self._template_program)
                     func = TextFunctionProgramConverter.text_to_function(str(program))
@@ -655,8 +680,8 @@ class MLES:
                                                                               training_mode=False)
 
                     score = score_images_dict.get('all_ins_performance', {}).get(instance_id, {}).get('score', float('-inf'))
-                    # print(f'{i} score is ', score) # 可选：为了日志干净可以注释掉详细打印
 
+                    # Update the best algorithm found for this specific instance
                     if score is not None and score > best_score_for_instance:
                         print(f'   Update! New Best: {score:.4f} (Algo index: {i})')
                         best_score_for_instance = score
@@ -664,8 +689,9 @@ class MLES:
                         best_perf_for_instance = score_images_dict.get('all_ins_performance', {})[instance_id]
                 except Exception as e:
                     print(f"\n      -> ❌ Error evaluating algorithm on instance {instance_id}: {e}")
-            print()  # 换行
+            print()
 
+            # Store the best result found for the current instance
             if best_algo_for_instance:
                 print(
                     f"   -> ✅ Best score found: {best_score_for_instance:.4f}")
@@ -680,9 +706,7 @@ class MLES:
                 final_results[instance_id] = {'score': None, 'evaluate_time': None}
                 print(f"   -> ⚠️ Warning: No algorithm produced a valid score for instance {instance_id}.")
 
-        # ===================================================================
-        # FINALIZE: 计算最终统计数据并保存
-        # ===================================================================
+        # --- STEP 4: Statistics & Worst-Case Analysis ---
         valid_scores = [s for s in all_scores if s is not None]
 
         if valid_scores:
@@ -694,11 +718,7 @@ class MLES:
 
         final_results['each_result'] = all_scores
 
-        # ... (此处省略 Worst-Case 统计代码，保持你原有的逻辑不变) ...
-        # 为了完整性，你可以直接把你的 Worst-Case 代码块放在这里
-        # ===================================================================
-        # [统计 Worst-Case (Bottom K%)]
-        # ===================================================================
+        # Identify instances with the lowest scores (Bottom K%) to analyze robustness
         id_score_pairs = []
         for k, v in final_results.items():
             if isinstance(k, int) and isinstance(v, dict) and v.get('score') is not None:
@@ -708,12 +728,14 @@ class MLES:
         cutoff_count = int(total_valid_count * (worst_case_percent / 100.0))
         if cutoff_count == 0 and total_valid_count > 0:
             cutoff_count = 1
+
+        # Calculate worst-case statistics
         worst_cases = id_score_pairs[:cutoff_count]
         worst_instance_ids = [pair[0] for pair in worst_cases]
         worst_scores_values = [pair[1] for pair in worst_cases]
         worst_avg_score = sum(worst_scores_values) / len(worst_scores_values) if worst_scores_values else None
 
-        if worst_avg_score is not None:  # 加个判断防止打印 None
+        if worst_avg_score is not None:
             print(f"\n📉 [Worst-Case Stats] Bottom {worst_case_percent}% (Count: {len(worst_cases)}):")
             print(f"   -> Average Score: {worst_avg_score}")
 
@@ -724,8 +746,8 @@ class MLES:
             'instance_ids': worst_instance_ids,
             'scores': worst_scores_values
         }
-        # ===================================================================
 
+        # --- STEP 5: Finalize & Logging ---
         using_time_end = time.time()
         final_results['running_time'] = using_time_end - using_time_start
         print(f"Running time: {final_results['running_time']} seconds")

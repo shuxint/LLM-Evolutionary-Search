@@ -7,6 +7,12 @@ from ...base import *
 
 
 class MLESPrompt:
+    """
+    Template factory for Multimodal LLM prompts.
+    Converts evolutionary search operations (Initialization, Crossover, Mutation, Modification)
+    into structured instructions for the LLM.
+    """
+
     @classmethod
     def create_instruct_prompt(cls, prompt: str) -> List[Dict]:
         content = [
@@ -21,6 +27,11 @@ class MLESPrompt:
 
     @classmethod
     def get_prompt_i1(cls, task_prompt: str, template_function: Function):
+        """
+        [INIT] Zero-shot Initialization Prompt.
+        Requests the LLM to design a baseline algorithm from scratch based
+        solely on the task description.
+        """
         # template
         temp_func = copy.deepcopy(template_function)
         temp_func.body = ''
@@ -37,6 +48,11 @@ Please design a novel algorithm to address this task by following the steps belo
 
     @classmethod
     def get_prompt_e1(cls, task_prompt: str, indivs: List[Function], template_function: Function):
+        """
+        [CROSSOVER] Diversity-driven Crossover.
+        Provides multiple parent algorithms and explicitly asks the LLM
+        to create something 'totally different' to avoid local optima.
+        """
         for indi in indivs:
             assert hasattr(indi, 'algorithm')
         # template
